@@ -129,8 +129,24 @@ def _is_trusted_host(url: str) -> bool:
     Secrets (API keys, the Hermes API server key) and user files (audio,
     reference images) only ever cross the wire to such hosts. Any other
     destination would be a redirect chosen by the model and is refused.
+
+    A value must carry an http/https scheme and a named host to be trusted
+    at all: empty, host-less ("http://"), or foreign-scheme values are
+    never trusted.
     """
-    return _host_of(url) in ("127.0.0.1", "localhost", "::1", "host.docker.internal", "")
+    import urllib.parse
+
+    u = str(url or "").strip()
+    if not u:
+        return False
+    if "://" not in u:
+        u = "http://" + u
+    parsed = urllib.parse.urlparse(u)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    return (parsed.hostname or "").lower() in (
+        "127.0.0.1", "localhost", "::1", "host.docker.internal"
+    )
 
 
 def _base_url(ctx, explicit: str = "") -> str:
@@ -802,8 +818,13 @@ def make_project(ctx) -> Callable[..., str]:
             ).strip()
             if comfy_url:
                 cfg["comfy_url"] = comfy_url
+            # home_agent_url comes from the plugin setting only — never a
+            # tool arg: the studio server logs in to this URL with
+            # HOME_AGENT_PASSWORD, so a model-named host would receive the
+            # password. A Home Agent on another machine is a *user*
+            # decision: set the plugin's home_agent_url setting.
             home_agent_url = str(
-                args.get("home_agent_url") or ctx.get_config("home_agent_url", default="") or ""
+                ctx.get_config("home_agent_url", default="") or ""
             ).strip()
             if home_agent_url:
                 cfg["home_agent_url"] = home_agent_url
