@@ -130,6 +130,7 @@ class VidMuseAPI {
       | "fasth3"
       | "hybrid_ltx"
       | "hybrid_fast";
+    still_model?: "auto" | "zimage" | "h3image";
     hermes_url?: string;
     hermes_token?: string;
   }): Promise<any> {

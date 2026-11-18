@@ -88,3 +88,106 @@ def test_ha_default_url_port():
     # Env may override; when unset, client defaults to 8765
     if not __import__("os").getenv("HOME_AGENT_URL"):
         assert ":8765" in c.base_url or c.base_url.endswith(":8765")
+
+
+# ── MiniMax-H3-Image storyboard stills ────────────────────────────────────
+
+
+def test_normalize_still_model():
+    from server.pipeline import normalize_still_model
+
+    assert normalize_still_model(None) == "auto"
+    assert normalize_still_model("Z-Image") == "zimage"
+    assert normalize_still_model("h3_image") == "h3image"
+    assert normalize_still_model("MiniMax-H3-Image") == "h3image"
+    assert normalize_still_model("bogus") == "auto"
+
+
+def test_h3img_canvas_is_grid_aligned_and_near_target_area():
+    from server.image_generator import _h3img_canvas
+
+    w, h = _h3img_canvas(768, 448, megapixels=4.0)
+    assert w % 32 == 0 and h % 32 == 0
+    assert abs((w * h) / (1024 * 1024) - 4.0) < 0.4
+    assert abs(w / h - 768 / 448) < 0.05
+    # portrait identity sheet keeps its orientation
+    pw, ph = _h3img_canvas(768, 1024, megapixels=4.0)
+    assert ph > pw
+    # clamped to the model's effective range
+    big = _h3img_canvas(1024, 576, megapixels=99)
+    assert big[0] * big[1] <= 21 * 1024 * 1024
+
+
+def test_h3img_workflow_graph_has_no_cfg_and_flat_ref_sockets():
+    from server.image_generator import ComfyUIClient
+
+    client = ComfyUIClient(backend="local", url="http://127.0.0.1:8188")
+    wf = client._build_minimax_h3_image_workflow(
+        "a singer on a rooftop", 2720, 1536, seed=7,
+        reference_image_names=["a.jpg", "b.jpg"],
+    )
+    cond = wf["10"]
+    assert cond["class_type"] == "MiniMaxH3ImageConditioning"
+    assert cond["inputs"]["images.image_1"] == ["21", 0]
+    assert cond["inputs"]["images.image_2"] == ["22", 0]
+    assert wf["2"]["inputs"]["type"] == "minimax"
+    ks = wf["12"]["inputs"]
+    assert ks["steps"] == 6 and ks["cfg"] == 1.0
+    assert ks["sampler_name"] == "euler" and ks["scheduler"] == "simple"
+    # no negative text encode — only a zeroed copy of the positive
+    assert wf["11"]["class_type"] == "ConditioningZeroOut"
+    assert not any(n["class_type"] == "CLIPTextEncode" for n in wf.values())
+
+    no_refs = client._build_minimax_h3_image_workflow("x", 1024, 1024, seed=1)
+    assert not any(k.startswith("images.") for k in no_refs["10"]["inputs"])
+
+
+def test_h3img_prompt_tagging():
+    from server.image_generator import ComfyUIClient
+
+    tag = ComfyUIClient._h3img_tag_prompt
+    assert tag("neon alley", 0) == "neon alley"
+    one = tag("neon alley", 1)
+    assert "<Picture 1>" in one and "<Picture 2>" not in one and "neon alley" in one
+    assert "<Picture 2>" in tag("neon alley", 2)
+    # already-tagged prompts are left alone
+    assert tag("<Picture 1> walks", 1) == "<Picture 1> walks"
+
+
+def test_h3img_status_reports_missing_and_ready():
+    from server.image_generator import ComfyUIClient
+
+    client = ComfyUIClient(backend="local", url="http://127.0.0.1:8188")
+    client._available_models = ["z_image_turbo_bf16.safetensors"]
+    client._object_nodes = {"KSampler"}
+    status = client._h3img_status()
+    assert not status["ready"]
+    assert any("MiniMaxH3ImageConditioning" in m for m in status["missing"])
+
+    client._available_models = [
+        "minimax_h3_image_pruned_bf16.safetensors",
+        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "minimax_h3_image_vae_fp16.safetensors",
+    ]
+    client._object_nodes = {"MiniMaxH3ImageConditioning"}
+    status = client._h3img_status()
+    assert status["ready"], status["missing"]
+    files = client._h3img_files()
+    # picks installed variants instead of the int8 defaults
+    assert files["unet"].endswith("pruned_bf16.safetensors")
+    assert "nvfp4" in files["clip"]
+
+
+def test_resolve_still_model_explicit_and_cloud():
+    import asyncio
+
+    from server.image_generator import ComfyUIClient
+
+    local = ComfyUIClient(backend="local", url="http://127.0.0.1:8188")
+    local.still_model = "h3image"
+    assert asyncio.run(local.resolve_still_model()) == "h3image"
+    local.still_model = "zimage"
+    assert asyncio.run(local.resolve_still_model()) == "zimage"
+    cloud = ComfyUIClient(backend="cloud")
+    cloud.still_model = "auto"
+    assert asyncio.run(cloud.resolve_still_model()) == "zimage"

@@ -239,6 +239,7 @@ def _hydrate_director(director: HermesDirector, session: Dict[str, Any]) -> None
         video_model=lanes.get("video_model")
         or session.get("video_model")
         or "minimax-h3",
+        still_model=session.get("still_model"),
     )
     lyrics = (session.get("lyrics") or "").strip()
     if lyrics and isinstance(director.audio_analysis, dict):
@@ -280,6 +281,7 @@ def _write_project_manifest(session_id: str, session: Dict[str, Any]) -> None:
             "video_model": session.get("video_model")
             or session.get("video_backend")
             or "minimax-h3",
+            "still_model": session.get("still_model") or "auto",
             "home_agent_url": session.get("home_agent_url") or "",
             "hermes_url": session.get("hermes_url") or "",
         },
@@ -479,6 +481,7 @@ def _load_session_from_disk(session_id: str) -> Dict[str, Any]:
         "pipeline_director": pipeline.get("director") or "cloud_llm",
         "pipeline_stills": pipeline.get("stills") or "comfy",
         "pipeline_video": pipeline.get("video") or "comfy_cloud",
+        "still_model": pipeline.get("still_model") or "auto",
         "home_agent_url": pipeline.get("home_agent_url") or "",
         "hermes_url": pipeline.get("hermes_url") or "",
         "timeline_plan": plan,
@@ -917,6 +920,13 @@ async def configure_session(request: dict):
         lanes["video_model"] = normalize_video_model(request.get("video_model"))
     session.update(lanes)
     session["video_model"] = lanes.get("video_model") or video_model
+    from server.pipeline import normalize_still_model
+
+    session["still_model"] = normalize_still_model(
+        request["still_model"]
+        if "still_model" in request
+        else session.get("still_model")
+    )
     # Legacy boolean mirrors for older clients
     session["use_home_agent_llm"] = lanes["pipeline_director"] == "home_agent"
     session["use_home_agent_stills"] = lanes["pipeline_stills"] == "home_agent"
@@ -1054,14 +1064,16 @@ async def configure_session(request: dict):
         stills=lanes["pipeline_stills"],
         video=lanes["pipeline_video"],
         video_model=session["video_model"],
+        still_model=session["still_model"],
     )
     LOG.info(
-        "Session %s pipeline dir=%s stills=%s video=%s model=%s comfy=%s (%s)",
+        "Session %s pipeline dir=%s stills=%s video=%s model=%s still_model=%s comfy=%s (%s)",
         session_id,
         lanes["pipeline_director"],
         lanes["pipeline_stills"],
         lanes["pipeline_video"],
         session["video_model"],
+        session["still_model"],
         comfy_backend,
         director.comfy_url,
     )
@@ -1079,6 +1091,7 @@ async def configure_session(request: dict):
         "pipeline_director": lanes["pipeline_director"],
         "pipeline_stills": lanes["pipeline_stills"],
         "pipeline_video": lanes["pipeline_video"],
+        "still_model": session["still_model"],
         "has_lyrics": bool((session.get("lyrics") or "").strip()),
     }
 
@@ -2285,6 +2298,7 @@ async def resume_project(request: dict):
         "pipeline_stills": session.get("pipeline_stills"),
         "pipeline_video": session.get("pipeline_video"),
         "video_model": session.get("video_model"),
+        "still_model": session.get("still_model") or "auto",
         "comfy_backend": session.get("comfy_backend"),
         "comfy_url": session.get("comfy_url"),
         "home_agent_url": session.get("home_agent_url"),

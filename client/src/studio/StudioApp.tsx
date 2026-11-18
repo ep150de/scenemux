@@ -26,6 +26,7 @@ import {
 import type { StudioScene, TimelinePlan } from "./types";
 import {
   PIPELINE_PRESETS,
+  STILL_MODEL_OPTIONS,
   VIDEO_MODEL_OPTIONS,
   comfyBackendFromVideo,
   needsComfyUrl,
@@ -36,6 +37,7 @@ import {
   type PipelinePresetId,
   type PipelineStills,
   type PipelineVideo,
+  type StillModel,
   type VideoModel,
 } from "./pipeline";
 
@@ -161,6 +163,9 @@ export function StudioApp({ serverHealth }: Props) {
   const [pipelineVideo, setPipelineVideo] =
     useState<PipelineVideo>("comfy_cloud");
   const [videoModel, setVideoModel] = useState<VideoModel>("minimax-h3");
+  const [stillModel, setStillModel] = useState<StillModel>(
+    () => (localStorage.getItem("scenemux-still-model") as StillModel) || "auto"
+  );
   const [homeAgentUrl, setHomeAgentUrl] = useState(
     () => localStorage.getItem("scenemux-ha-url") || "http://localhost:8765"
   );
@@ -242,6 +247,16 @@ export function StudioApp({ serverHealth }: Props) {
     [pipelineDirector, pipelineStills, pipelineVideo, videoModel]
   );
 
+  const h3ImageStatus = serverHealth?.services?.comfyui?.image_models?.h3image as
+    | {
+        ready?: boolean;
+        missing?: string[];
+        vram_gb?: number | null;
+        min_vram_gb?: number;
+        note?: string;
+      }
+    | undefined;
+
   const engineHealth = useMemo(() => {
     const vm = serverHealth?.services?.comfyui?.video_models;
     const fal = serverHealth?.services?.fal;
@@ -254,8 +269,9 @@ export function StudioApp({ serverHealth }: Props) {
       fasth3: local ? (vm ? Boolean(vm.fasth3?.ready) : null) : null,
       ltx23: local ? (vm ? Boolean(vm.ltx23?.ready) : null) : null,
       fal: falReady,
+      h3image: h3ImageStatus ? Boolean(h3ImageStatus.ready) : null,
     };
-  }, [serverHealth, pipelineVideo]);
+  }, [serverHealth, pipelineVideo, h3ImageStatus]);
 
   const h3Ready = engineHealth.h3;
 
@@ -321,6 +337,7 @@ export function StudioApp({ serverHealth }: Props) {
       pipeline_director: pipelineDirector,
       pipeline_stills: pipelineStills,
       pipeline_video: pipelineVideo,
+      still_model: stillModel,
       use_home_agent_llm: pipelineDirector === "home_agent",
       use_home_agent_stills: pipelineStills === "home_agent",
     }),
@@ -337,6 +354,7 @@ export function StudioApp({ serverHealth }: Props) {
       pipelinePreset,
       pipelineStills,
       pipelineVideo,
+      stillModel,
       videoModel,
     ]
   );
@@ -839,6 +857,7 @@ export function StudioApp({ serverHealth }: Props) {
       if (look) setPerformerLook(String(look));
       if (data.pipeline_director) setPipelineDirector(data.pipeline_director);
       if (data.pipeline_stills) setPipelineStills(data.pipeline_stills);
+      if (data.still_model) setStillModel(data.still_model as StillModel);
       if (data.pipeline_video) {
         setPipelineVideo(data.pipeline_video);
         coerceFalDraftEngine(
@@ -1727,6 +1746,38 @@ export function StudioApp({ serverHealth }: Props) {
                     </label>
                   </div>
 
+                  {pipelineStills === "comfy" && (
+                    <div className="pipeline-lanes">
+                      <label className="pipeline-lane">
+                        <span>Stills model</span>
+                        <select
+                          className="studio-field"
+                          value={stillModel}
+                          onChange={(e) => {
+                            const next = e.target.value as StillModel;
+                            setStillModel(next);
+                            localStorage.setItem("scenemux-still-model", next);
+                          }}
+                          aria-label="Comfy stills model"
+                        >
+                          {STILL_MODEL_OPTIONS.map((o) => (
+                            <option key={o.id} value={o.id} title={o.hint}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  )}
+                  {pipelineStills === "comfy" && stillModel !== "zimage" && (
+                    <p className="identity-hint">
+                      {STILL_MODEL_OPTIONS.find((o) => o.id === stillModel)?.hint}
+                      {stillModel === "h3image" && engineHealth.h3image === false
+                        ? ` — host missing: ${(h3ImageStatus?.missing || []).join(", ") || "weights"}. Falls back to Z-Image.`
+                        : ""}
+                    </p>
+                  )}
+
                   <p className="engine-chips" aria-label="Engine health">
                     <span
                       className={`engine-chip ${
@@ -1768,6 +1819,35 @@ export function StudioApp({ serverHealth }: Props) {
                       {engineHealth.ltx23 == null
                         ? "—"
                         : engineHealth.ltx23
+                          ? "ready"
+                          : "missing"}
+                    </span>
+                    <span
+                      className={`engine-chip ${
+                        engineHealth.h3image === true
+                          ? "ok"
+                          : engineHealth.h3image === false
+                            ? "bad"
+                            : ""
+                      }`}
+                      title={
+                        h3ImageStatus
+                          ? `MiniMax-H3-Image stills${
+                              h3ImageStatus.vram_gb
+                                ? ` · GPU ${h3ImageStatus.vram_gb} GB`
+                                : ""
+                            }${
+                              h3ImageStatus.missing?.length
+                                ? ` · missing: ${h3ImageStatus.missing.join(", ")}`
+                                : ""
+                            }`
+                          : "Connect a local Comfy host to detect MiniMax-H3-Image"
+                      }
+                    >
+                      H3 Image{" "}
+                      {engineHealth.h3image == null
+                        ? "—"
+                        : engineHealth.h3image
                           ? "ready"
                           : "missing"}
                     </span>

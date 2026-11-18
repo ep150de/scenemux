@@ -13,6 +13,7 @@ export type VideoModel =
   | "fasth3"
   | "hybrid_ltx"
   | "hybrid_fast";
+export type StillModel = "auto" | "zimage" | "h3image";
 export type PipelinePresetId =
   | "cloud"
   | "playground"
@@ -58,6 +59,28 @@ export const VIDEO_MODEL_OPTIONS: Array<{
     id: "hybrid_ltx",
     label: "Hybrid LTX",
     hint: "PERF → H3 Ref2VA; B-roll → LTX IA2V",
+  },
+];
+
+export const STILL_MODEL_OPTIONS: Array<{
+  id: StillModel;
+  label: string;
+  hint: string;
+}> = [
+  {
+    id: "auto",
+    label: "Auto",
+    hint: "MiniMax-H3-Image when the Comfy host has the weights + ≥24 GB VRAM, else Z-Image",
+  },
+  {
+    id: "h3image",
+    label: "MiniMax H3 Image",
+    hint: "6-step 33B T2I + multi-reference identity; ~4 MP default, high-VRAM GPU",
+  },
+  {
+    id: "zimage",
+    label: "Z-Image Turbo",
+    hint: "Fast 8-step stills; works on small GPUs and Comfy Cloud",
   },
 ];
 

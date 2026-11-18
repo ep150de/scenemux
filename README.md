@@ -79,7 +79,7 @@ The TUI wizard picks local vs cloud, collects API keys, checks dependencies, and
 ## Architecture
 
 - **LLM** — Cloud Ollama / OpenCode, or Home Agent / Hermes as director  
-- **ComfyUI / Comfy Cloud** — Storyboard stills + H3 / FastH3 / LTX video  
+- **ComfyUI / Comfy Cloud** — Storyboard stills (Z-Image Turbo, or [MiniMax-H3-Image](docs/ENGINES.md#minimax-h3-image-storyboard-stills) on high-VRAM local hosts) + H3 / FastH3 / LTX video  
 - **Hermes Director** — Plan → stills → per-scene render → assemble  
 - **FFmpeg** — Scene concat + master MP3 mux  
 - **Optional FAL** — Prepaid/trial draft stills/clips only (not Hybrid Fast H3)  

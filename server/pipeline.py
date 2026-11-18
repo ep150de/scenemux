@@ -7,6 +7,10 @@ from typing import Any, Dict, Optional
 DIRECTOR_CHOICES = ("cloud_llm", "home_agent", "hermes")
 STILLS_CHOICES = ("comfy", "home_agent", "fal")
 VIDEO_CHOICES = ("comfy_cloud", "comfy_local", "home_agent", "fal")
+# Which model renders storyboard/identity stills when the stills lane is Comfy.
+# ``auto`` picks MiniMax-H3-Image only when the local Comfy host has the weights,
+# the ``MiniMaxH3ImageConditioning`` node, and enough VRAM; otherwise Z-Image.
+STILL_MODEL_CHOICES = ("auto", "zimage", "h3image")
 VIDEO_MODEL_CHOICES = (
     "minimax-h3",
     "ltx23",
@@ -82,6 +86,24 @@ def normalize_video_model(raw: Any) -> str:
     if mapped not in VIDEO_MODEL_CHOICES:
         return "minimax-h3"
     return mapped
+
+
+def normalize_still_model(raw: Any) -> str:
+    """Normalize a Comfy stills model choice (auto / zimage / h3image)."""
+    sm = str(raw or "").strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "default": "auto",
+        "zimage": "zimage",
+        "zimageturbo": "zimage",
+        "turbo": "zimage",
+        "h3image": "h3image",
+        "minimaxh3image": "h3image",
+        "h3img": "h3image",
+        "h3": "h3image",
+    }
+    return aliases.get(sm, "auto")
 
 
 def is_perf_scene(scene_type: Any) -> bool:

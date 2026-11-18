@@ -66,6 +66,78 @@ _DEFAULT_H3_LIGHTNING_LORA = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.saf
 # FastVideo FastH3 8-step distilled (I2V first/last + T2V only — no Ref2VA)
 _DEFAULT_FASTH3_UNET = "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors"
 _DEFAULT_FASTH3_VIDEO_VAE = "minimax_h3_video_vae_int8_convrot.safetensors"
+# MiniMax-H3-Image (T2I + multi-reference edit, 6-step distilled, no CFG).
+# Files come from Comfy-Org/MiniMax-H3-Image and Comfy-Org/MiniMax-H3 (text encoder).
+_DEFAULT_H3IMG_UNET = "minimax_h3_image_pruned_int8_convrot.safetensors"
+_DEFAULT_H3IMG_CLIP = "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+_DEFAULT_H3IMG_VAE = "minimax_h3_image_vae_fp16.safetensors"
+# Installed-variant preference (first match wins). nvfp4 text encoders are
+# Blackwell-only fast paths, so they rank last for portability.
+_H3IMG_UNET_PREFS = (
+    "minimax_h3_image_pruned_int8_convrot",
+    "minimax_h3_image_pruned_bf16",
+    "minimax_h3_image_pruned_w4a8",
+    "minimax_h3_image",
+)
+_H3IMG_CLIP_PREFS = (
+    "qwen3vl_32b_minimax_h3_int8_convrot",
+    "qwen3vl_32b_minimax_h3_bf16",
+    "qwen3vl_32b_minimax_h3_nvfp4_awq",
+    "qwen3vl_32b_minimax_h3",
+)
+_H3IMG_NODE = "MiniMaxH3ImageConditioning"
+_H3IMG_MAX_REFS = 16
+
+
+def _normalize_still_env(raw: Optional[str]) -> str:
+    from server.pipeline import normalize_still_model
+
+    return normalize_still_model(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _vram_from_stats(stats: Dict[str, Any]) -> Optional[float]:
+    """Largest GPU VRAM in GB from a Comfy ``/system_stats`` payload."""
+    totals = [
+        float(d.get("vram_total") or 0)
+        for d in (stats.get("devices") or [])
+        if isinstance(d, dict)
+    ]
+    best = max(totals) if totals else 0.0
+    return round(best / (1024**3), 1) if best else None
+
+
+def _h3img_canvas(
+    width: int,
+    height: int,
+    megapixels: Optional[float] = None,
+) -> tuple[int, int]:
+    """Pick an H3-Image canvas from a requested aspect ratio.
+
+    The model is tuned for ~4–20 MP and degrades at low resolution, so the
+    director's small preview sizes (e.g. 768x448) are treated only as an aspect
+    hint. Edges snap to the 32 px grid the model requires.
+    """
+    w0, h0 = max(1, int(width)), max(1, int(height))
+    mp = megapixels if megapixels is not None else _env_float("COMFY_H3IMG_MEGAPIXELS", 4.0)
+    mp = min(max(mp, 1.0), 20.0)
+    aspect = w0 / float(h0)
+    area = mp * 1024 * 1024
+    w = (area * aspect) ** 0.5
+    h = w / aspect
+    max_edge = 8192
+    scale = min(1.0, max_edge / max(w, h))
+    w, h = w * scale, h * scale
+    return (
+        max(32, int(round(w / 32.0)) * 32),
+        max(32, int(round(h / 32.0)) * 32),
+    )
 
 
 def _h3_align_frames(num_frames: int) -> int:
@@ -129,6 +201,15 @@ class ComfyUIClient:
         self._available_models: Optional[List[str]] = None
         self._model_probe_error: Optional[str] = None
         self._resolved_ckpt_log: set[str] = set()
+        # Comfy node classes from /object_info (local only) — used to confirm
+        # MiniMaxH3ImageConditioning exists (ComfyUI >= 0.45).
+        self._object_nodes: Optional[set[str]] = None
+        # Stills model: auto | zimage | h3image (session overrides env default).
+        self.still_model: str = _normalize_still_env(os.getenv("COMFY_STILLS_MODEL"))
+        self._auto_still_cache: Optional[tuple[float, str]] = None
+        # Optional async hook (prompt -> expanded prompt) set by the director so
+        # H3-Image gets the detailed English captions it was trained on.
+        self.prompt_expander: Optional[Any] = None
 
     def _headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {}
@@ -180,6 +261,7 @@ class ComfyUIClient:
                         return []
                     objects = await resp.json()
                     models = self._extract_models_from_object_info(objects)
+                    self._object_nodes = set(objects.keys())
                     self._available_models = models
                     self._model_probe_error = None
                     return models
@@ -2656,9 +2738,26 @@ class ComfyUIClient:
         Pass reference_image_paths to lock identity via TextEncodeZImageOmni.
         FaceID is opt-in only (COMFY_IDENTITY_BACKEND=faceid) — Comfy Cloud often
         lacks the FaceID LoRA / ClipVision weights.
+
+        When the session stills model is ``h3image`` (or ``auto`` resolves to it on a
+        capable local host) MiniMax-H3-Image is tried first, then Z-Image as fallback.
         """
         if self.backend != "cloud":
             await self.probe_available_models()
+
+        if await self.resolve_still_model() == "h3image":
+            try:
+                h3_path = await self.generate_image_h3(
+                    prompt, width, height, seed, reference_image_paths
+                )
+            except Exception as exc:
+                print(f"[ComfyUI] H3-Image error: {exc}")
+                h3_path = None
+            if h3_path:
+                return h3_path
+            if os.getenv("COMFY_H3IMG_STRICT", "").strip().lower() in ("1", "true", "yes"):
+                return None
+            print("[ComfyUI] H3-Image failed — falling back to Z-Image")
 
         ref_names: List[str] = []
         paths = [p for p in (reference_image_paths or []) if p and Path(p).is_file()][:3]
@@ -2763,6 +2862,311 @@ class ComfyUIClient:
         """Generate image using FLUX Dev (fallback)."""
         workflow = self._build_flux_workflow(prompt, width, height, seed)
         return await self._dispatch_workflow(workflow, wait_timeout=300)
+
+    # ── MiniMax-H3-Image (storyboard stills) ──────────────────────────────
+
+    @staticmethod
+    def _first_installed(
+        models: List[str],
+        prefs: tuple[str, ...],
+        exclude: tuple[str, ...] = (),
+    ) -> Optional[str]:
+        for pref in prefs:
+            for m in models:
+                low = Path(m).name.lower()
+                if pref in low and not any(x in low for x in exclude):
+                    return m
+        return None
+
+    def _h3img_files(self) -> Dict[str, str]:
+        """Resolve UNET / text encoder / VAE names (env > installed variant > default)."""
+        models = (self._available_models or []) if self.backend != "cloud" else []
+        unet = os.getenv("COMFY_H3IMG_UNET") or (
+            self._first_installed(models, _H3IMG_UNET_PREFS, exclude=("vae", "_pe"))
+            or _DEFAULT_H3IMG_UNET
+        )
+        clip = os.getenv("COMFY_H3IMG_CLIP") or (
+            self._first_installed(models, _H3IMG_CLIP_PREFS) or _DEFAULT_H3IMG_CLIP
+        )
+        vae = os.getenv("COMFY_H3IMG_VAE") or (
+            self._first_installed(models, ("minimax_h3_image_vae",)) or _DEFAULT_H3IMG_VAE
+        )
+        return {"unet": unet, "clip": clip, "vae": vae}
+
+    def _h3img_status(self) -> Dict[str, Any]:
+        """Readiness of MiniMax-H3-Image on the connected local Comfy host."""
+        models = self._available_models or []
+        files = self._h3img_files()
+        has = {
+            key: self._model_list_has(models, name) for key, name in files.items()
+        }
+        node_ok: Optional[bool] = None
+        if self._object_nodes is not None:
+            node_ok = _H3IMG_NODE in self._object_nodes
+        missing = [files[k] for k, ok in has.items() if not ok]
+        if node_ok is False:
+            missing.append(f"node:{_H3IMG_NODE} (update ComfyUI to >= 0.45)")
+        return {
+            "ready": not missing,
+            "requires": [files["unet"], files["clip"], files["vae"]],
+            "missing": missing,
+            "node_available": node_ok,
+            "megapixels": _env_float("COMFY_H3IMG_MEGAPIXELS", 4.0),
+            "min_vram_gb": _env_float("COMFY_H3IMG_AUTO_MIN_VRAM_GB", 24.0),
+            "note": (
+                "ComfyUI >= 0.45; 6-step, no CFG / negative prompt. Prefer 4–6 MP for "
+                "storyboards (16 MP native needs a 48 GB+ GPU or heavy offload). "
+                "HF Comfy-Org/MiniMax-H3-Image + Comfy-Org/MiniMax-H3."
+            ),
+        }
+
+    async def _gpu_vram_gb(self) -> Optional[float]:
+        """Largest GPU VRAM (GB) reported by local Comfy ``/system_stats``."""
+        if self.backend == "cloud":
+            return None
+        try:
+            async with aiohttp.ClientSession(headers=self._headers()) as session:
+                async with session.get(f"{self.url}/system_stats", timeout=8) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+        except Exception:
+            return None
+        return _vram_from_stats(data)
+
+    async def resolve_still_model(self) -> str:
+        """Concrete stills model for this client: ``zimage`` or ``h3image``."""
+        choice = self.still_model
+        if choice in ("zimage", "h3image"):
+            return choice
+        # auto — only local hosts with weights + node + enough VRAM
+        if self.backend == "cloud":
+            return "zimage"
+        cached = self._auto_still_cache
+        if cached and time.time() - cached[0] < 120:
+            return cached[1]
+        await self.probe_available_models(force=True)
+        picked = "zimage"
+        if self._h3img_status()["ready"]:
+            vram = await self._gpu_vram_gb()
+            need = _env_float("COMFY_H3IMG_AUTO_MIN_VRAM_GB", 24.0)
+            if vram is None or vram >= need:
+                picked = "h3image"
+            else:
+                print(
+                    f"[ComfyUI] H3-Image installed but GPU has {vram:.0f} GB "
+                    f"(< {need:.0f} GB auto threshold) — using Z-Image. "
+                    "Set stills model to H3 Image to force it."
+                )
+        self._auto_still_cache = (time.time(), picked)
+        if picked == "h3image":
+            print("[ComfyUI] Auto stills model: MiniMax-H3-Image")
+        return picked
+
+    @staticmethod
+    def _h3img_tag_prompt(prompt: str, ref_count: int) -> str:
+        """Address identity refs with the model's 1-based ``<Picture n>`` tags."""
+        text = (prompt or "").strip()
+        if ref_count <= 0 or "<picture 1>" in text.lower():
+            return text
+        lead = (
+            "<Picture 1> is the lead performer's identity reference: keep exactly the "
+            "same face, bone structure, hair, skin tone, age and distinguishing "
+            "features. Do not copy its pose, crop or background."
+        )
+        if ref_count > 1:
+            others = ", ".join(f"<Picture {i}>" for i in range(2, ref_count + 1))
+            lead += f" {others} show the same performer from other angles."
+        return f"{lead} Create a new image: {text}"
+
+    def _build_minimax_h3_image_workflow(
+        self,
+        prompt: str,
+        width: int,
+        height: int,
+        seed: Optional[int] = None,
+        reference_image_names: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """MiniMax-H3-Image text-to-image / multi-reference graph.
+
+        Mirrors the official ``image_minimax_h3_image_t2i`` / ``..._edit`` templates:
+        6 euler/simple steps, cfg 1, no negative prompt (``ConditioningZeroOut``).
+        References are flat dotted sockets ``images.image_N`` (1-based) and appear in
+        the prompt as ``<Picture N>``.
+        """
+        if seed is None:
+            seed = int(time.time()) % (2**32)
+        files = self._h3img_files()
+        width = max(32, (int(width) // 32) * 32)
+        height = max(32, (int(height) // 32) * 32)
+        refs = [n for n in (reference_image_names or []) if n][:_H3IMG_MAX_REFS]
+
+        cond_inputs: Dict[str, Any] = {
+            "clip": ["2", 0],
+            "vae": ["3", 0],
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+        }
+        workflow: Dict[str, Any] = {
+            "1": {
+                "inputs": {
+                    "unet_name": files["unet"],
+                    "weight_dtype": os.getenv("COMFY_H3IMG_WEIGHT_DTYPE", "default"),
+                },
+                "class_type": "UNETLoader",
+            },
+            "2": {
+                "inputs": {
+                    "clip_name": files["clip"],
+                    "type": "minimax",
+                    "device": "default",
+                },
+                "class_type": "CLIPLoader",
+            },
+            "3": {
+                "inputs": {"vae_name": files["vae"]},
+                "class_type": "VAELoader",
+            },
+        }
+        for i, name in enumerate(refs, start=1):
+            node_id = str(20 + i)
+            workflow[node_id] = {
+                "inputs": {"image": name},
+                "class_type": "LoadImage",
+            }
+            cond_inputs[f"images.image_{i}"] = [node_id, 0]
+
+        workflow.update(
+            {
+                "10": {
+                    "inputs": cond_inputs,
+                    "class_type": _H3IMG_NODE,
+                },
+                "11": {
+                    "inputs": {"conditioning": ["10", 0]},
+                    "class_type": "ConditioningZeroOut",
+                },
+                "12": {
+                    "inputs": {
+                        "model": ["1", 0],
+                        "seed": seed,
+                        "steps": int(os.getenv("COMFY_H3IMG_STEPS", "6")),
+                        "cfg": 1.0,
+                        "sampler_name": os.getenv("COMFY_H3IMG_SAMPLER", "euler"),
+                        "scheduler": os.getenv("COMFY_H3IMG_SCHEDULER", "simple"),
+                        "denoise": 1.0,
+                        "positive": ["10", 0],
+                        "negative": ["11", 0],
+                        "latent_image": ["10", 1],
+                    },
+                    "class_type": "KSampler",
+                },
+                "13": {
+                    "inputs": {"samples": ["12", 0], "vae": ["3", 0]},
+                    "class_type": "VAEDecode",
+                },
+                "14": {
+                    "inputs": {
+                        "filename_prefix": "vidmuse_h3image",
+                        "images": ["13", 0],
+                    },
+                    "class_type": "SaveImage",
+                },
+            }
+        )
+        return workflow
+
+    def _h3img_finalize(self, path: str) -> str:
+        """Downscale 4–16 MP output to a pipeline-friendly size (keeps the original)."""
+        max_edge = int(_env_float("COMFY_H3IMG_OUTPUT_MAX_EDGE", 2048))
+        if max_edge <= 0:
+            return path
+        try:
+            from PIL import Image
+
+            src = Path(path)
+            with Image.open(src) as im:
+                w, h = im.size
+                if max(w, h) <= max_edge:
+                    return path
+                scale = max_edge / float(max(w, h))
+                out_dir = OUTPUT_DIR / "h3_image_stills"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dest = out_dir / f"{src.stem}_{max_edge}.png"
+                im.convert("RGB").resize(
+                    (max(1, round(w * scale)), max(1, round(h * scale))),
+                    Image.Resampling.LANCZOS,
+                ).save(dest, format="PNG")
+            print(f"[ComfyUI] H3-Image {w}x{h} -> {dest.name} (full-res kept in cache)")
+            return str(dest)
+        except Exception as exc:
+            print(f"[ComfyUI] H3-Image downscale skipped ({exc})")
+            return path
+
+    async def generate_image_h3(
+        self,
+        prompt: str,
+        width: int = 1024,
+        height: int = 576,
+        seed: Optional[int] = None,
+        reference_image_paths: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Generate a storyboard still with MiniMax-H3-Image.
+
+        ``width``/``height`` set only the aspect ratio; the real canvas comes from
+        ``COMFY_H3IMG_MEGAPIXELS`` (default 4 MP — the model degrades at low res).
+        Returns None when the host lacks the weights/node so callers can fall back.
+        """
+        if self.backend != "cloud":
+            await self.probe_available_models()
+            status = self._h3img_status()
+            if not status["ready"]:
+                print(f"[ComfyUI] H3-Image unavailable — missing: {status['missing']}")
+                return None
+
+        text = (prompt or "").strip()
+        if self.prompt_expander and os.getenv("COMFY_H3IMG_EXPAND", "1").strip() != "0":
+            try:
+                expanded = await asyncio.wait_for(self.prompt_expander(text), timeout=90)
+                if expanded and expanded.strip():
+                    text = expanded.strip()
+            except Exception as exc:
+                print(f"[ComfyUI] H3-Image prompt expand skipped ({exc})")
+
+        max_refs = min(
+            _H3IMG_MAX_REFS, max(0, int(_env_float("COMFY_H3IMG_MAX_REFS", 3)))
+        )
+        paths = [p for p in (reference_image_paths or []) if p and Path(p).is_file()][
+            :max_refs
+        ]
+        ref_names: List[str] = []
+        if paths:
+            async with aiohttp.ClientSession(headers=self._headers()) as session:
+                for p in paths:
+                    prepared = self._prepare_identity_ref(p, size=1024)
+                    name = await self._upload_input_file(session, prepared, "image")
+                    if name:
+                        ref_names.append(name)
+            if len(ref_names) < len(paths):
+                print(
+                    f"[ComfyUI] H3-Image: {len(paths) - len(ref_names)} ref upload(s) failed"
+                )
+        text = self._h3img_tag_prompt(text, len(ref_names))
+
+        canvas_w, canvas_h = _h3img_canvas(width, height)
+        workflow = self._build_minimax_h3_image_workflow(
+            text, canvas_w, canvas_h, seed, ref_names or None
+        )
+        timeout = int(_env_float("COMFY_H3IMG_TIMEOUT", 900))
+        print(
+            f"[ComfyUI] H3-Image {canvas_w}x{canvas_h} refs={len(ref_names)} "
+            f"timeout={timeout}s"
+        )
+        path = await self._dispatch_workflow(workflow, wait_timeout=timeout)
+        if not path:
+            return None
+        return self._h3img_finalize(path)
 
     # ── HuMo Lip-Sync Workflow ────────────────────────────────────────────
 
@@ -3129,6 +3533,12 @@ class ComfyUIClient:
                             result["resolved_turbo_ckpt"] = self._default_ckpt("turbo")
                             result["local_image_backend"] = self._local_image_backend()
                             result["video_models"] = self._probe_video_backend_models(models)
+                            h3img = self._h3img_status()
+                            h3img["vram_gb"] = _vram_from_stats(data)
+                            result["image_models"] = {
+                                "h3image": h3img,
+                                "active": self.still_model,
+                            }
                             if self._model_probe_error:
                                 result["model_probe_error"] = self._model_probe_error
                             try:

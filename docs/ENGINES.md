@@ -24,7 +24,7 @@ Do **not** claim FastH3 or LTX equals Ref2VA lip-sync quality.
 | Fast Draft | Local Comfy | FastH3 |
 | Custom | Advanced lanes | Your choice |
 
-Advanced mode exposes Director / Stills / Video host / Video engine, Comfy URL, Home Agent, Hermes, and engine health chips from `/api/health` → `services.comfyui.video_models`.
+Advanced mode exposes Director / Stills / Video host / Video engine, Comfy URL, Home Agent, Hermes, and engine health chips from `/api/health` → `services.comfyui.video_models` (and `image_models` for the stills model).
 
 ## FastH3 limits
 
@@ -36,6 +36,28 @@ Advanced mode exposes Director / Stills / Video host / Video engine, Comfy URL, 
 - SceneMux muxes your song slice over the clip (not model-native audio)
 
 Env overrides: `COMFY_FASTH3_UNET`, `COMFY_FASTH3_VIDEO_VAE`, `COMFY_FASTH3_STEPS` (default 8).
+
+## MiniMax-H3-Image (storyboard stills)
+
+Optional Comfy **stills model** for the Stills lane (`Advanced → Stills model`, API field `still_model`: `auto` | `h3image` | `zimage`, env default `COMFY_STILLS_MODEL`). One 33B checkpoint does text-to-image **and** multi-reference composition, so the identity sheet / performer refs stay locked across scenes (`<Picture 1>` = identity ref).
+
+- ComfyUI **≥ 0.45** (core node `MiniMaxH3ImageConditioning`; templates `image_minimax_h3_image_t2i` / `_edit`)
+- Distilled: **6 steps, euler/simple, cfg 1 — no negative prompt** (avoidances are written positively; the director LLM expands each still prompt into a detailed English caption, disable with `COMFY_H3IMG_EXPAND=0`)
+- Native ~16 MP, but the model degrades at low res. SceneMux renders at **~4 MP** (`COMFY_H3IMG_MEGAPIXELS`, 2688×1568 for 16:9) and saves a ≤2048 px copy for the pipeline (`COMFY_H3IMG_OUTPUT_MAX_EDGE`; full-res stays in `outputs/comfy_cache`)
+- `auto` picks H3-Image only on a **local** Comfy host that has the files, the node, and ≥ **24 GB** VRAM (`COMFY_H3IMG_AUTO_MIN_VRAM_GB`); otherwise Z-Image. Forcing `h3image` falls back to Z-Image if the host lacks it (`COMFY_H3IMG_STRICT=1` to fail instead)
+- Comfy Cloud: not auto-selected (node availability depends on Cloud's ComfyUI release)
+
+| File | Folder | Size |
+| --- | --- | --- |
+| `minimax_h3_image_pruned_int8_convrot.safetensors` | `models/diffusion_models/` | 21 GB (bf16: 40 GB, w4a8: 12.5 GB) |
+| `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | `models/text_encoders/` | 27 GB (nvfp4_awq: 15.7 GB, Blackwell) |
+| `minimax_h3_image_vae_fp16.safetensors` | `models/vae/` | 1.2 GB |
+
+Sources: [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image), [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) (text encoder; the same Qwen3-VL family as the H3 video encoder, so an existing one is reused). Hardware: int8 DiT + int8 text encoder ≈ 48 GB of weights — Comfy offloads between stages, so a 24 GB GPU works slowly, 48 GB+ (RTX 6000 Ada/Blackwell, H100/H200) is comfortable, and 16 MP output wants 48–96 GB. Official bf16 (66 GB DiT) is for multi-GPU / SGLang serving and is not wired here.
+
+Env overrides: `COMFY_H3IMG_UNET`, `_CLIP`, `_VAE`, `_WEIGHT_DTYPE`, `_STEPS`, `_SAMPLER`, `_SCHEDULER`, `_MAX_REFS` (default 3, max 16), `_TIMEOUT` (default 900 s — first run loads ~48 GB).
+
+Reference UI graphs from Comfy-Org/workflow_templates are kept in `server/comfyui_workflows/minimax_h3_image_{t2i,edit}_workflow.json` for manual testing in the Comfy UI. Health: `/api/health` → `services.comfyui.image_models.h3image` (`ready`, `missing`, `vram_gb`). **License:** MiniMax-H3-Image Community License — check commercial-use terms on the model card before shipping output.
 
 ## LTX-2.3 IA2V
 

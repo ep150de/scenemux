@@ -95,6 +95,10 @@ class HermesDirector:
         self.pipeline_stills: str = "comfy"
         self.pipeline_video: str = "comfy_cloud"
         self.video_model: str = "minimax-h3"
+        # Comfy stills model: auto | zimage | h3image (MiniMax-H3-Image)
+        self.still_model: str = self.comfyui.still_model
+        self._still_expand_cache: Dict[str, str] = {}
+        self._apply_still_settings()
 
         # Progress tracking
         self._progress_callback: Optional[ProgressCallback] = None
@@ -113,7 +117,50 @@ class HermesDirector:
         self.comfyui = ComfyUIClient(backend=normalized, url=url)
         self.comfy_backend = normalized
         self.comfy_url = self.comfyui.url
+        self._apply_still_settings()
         LOG.info("Session Comfy backend: %s (%s)", normalized, self.comfy_url)
+
+    def _apply_still_settings(self) -> None:
+        """Push the stills model + prompt expander onto the current Comfy client."""
+        self.comfyui.still_model = self.still_model
+        self.comfyui.prompt_expander = self._expand_still_prompt
+
+    async def _expand_still_prompt(self, prompt: str) -> str:
+        """Rewrite a tag-style still prompt into the detailed English caption
+        MiniMax-H3-Image was trained on (it has no negative prompt, so avoidances
+        are phrased positively). Falls back to the original text on any problem."""
+        text = (prompt or "").strip()
+        if not self.llm or not text:
+            return text
+        cached = self._still_expand_cache.get(text)
+        if cached:
+            return cached
+        try:
+            raw = await self.llm.generate(
+                prompt=f"Image prompt to rewrite:\n{text}",
+                system_prompt=(
+                    "You rewrite image prompts for the MiniMax-H3-Image model. Output ONE "
+                    "flowing English paragraph (90-170 words) describing the whole finished "
+                    "image: subject (face, hair, wardrobe), setting, shot framing and "
+                    "composition, lighting, color palette, mood and texture. Keep every "
+                    "concrete fact from the input and never swap the subject. No lists, "
+                    "markdown, quotes or Picture tags. The model has no negative prompt, so "
+                    "state what is present instead (for 'no text' write 'a clean image with "
+                    "no lettering or logos'). Output only the caption."
+                ),
+                max_tokens=700,
+                temperature=0.4,
+            )
+        except Exception as exc:
+            LOG.warning("H3-Image prompt expansion failed: %s", exc)
+            return text
+        out = (raw or "").strip().strip("`").strip('"').strip()
+        if len(out) < 40 or len(out) > 2500:
+            return text
+        if len(self._still_expand_cache) > 256:
+            self._still_expand_cache.clear()
+        self._still_expand_cache[text] = out
+        return out
 
     def configure_home_agent(
         self,
@@ -142,13 +189,17 @@ class HermesDirector:
         stills: str = "comfy",
         video: str = "comfy_cloud",
         video_model: str = "minimax-h3",
+        still_model: Optional[str] = None,
     ) -> None:
         self.pipeline_director = director
         self.pipeline_stills = stills
         self.pipeline_video = video
-        from server.pipeline import normalize_video_model
+        from server.pipeline import normalize_still_model, normalize_video_model
 
         self.video_model = normalize_video_model(video_model)
+        if still_model is not None:
+            self.still_model = normalize_still_model(still_model)
+            self._apply_still_settings()
         self.use_home_agent_stills = stills == "home_agent" and bool(self.home_agent_url)
         self.use_home_agent_video = video == "home_agent" and bool(self.home_agent_url)
 
